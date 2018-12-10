@@ -13,11 +13,11 @@ from functools import partial
 from sklearn.utils import shuffle
 from sklearn.metrics import accuracy_score
 
-from opt import adam, warmup_cosine, warmup_linear, warmup_constant
-from datasets import rocstories
-from analysis import rocstories as rocstories_analysis
-from text_utils import TextEncoder
-from utils import encode_dataset, flatten, iter_data, find_trainable_variables, convert_gradient_to_tensor, shape_list, ResultLogger, assign_to_gpu, average_grads, make_path
+from .opt import adam, warmup_cosine, warmup_linear, warmup_constant
+from .datasets import rocstories
+from .analysis import rocstories as rocstories_analysis
+from .text_utils import TextEncoder
+from .utils import encode_dataset, flatten, iter_data, find_trainable_variables, convert_gradient_to_tensor, shape_list, ResultLogger, assign_to_gpu, average_grads, make_path
 
 def gelu(x):
     return 0.5*x*(1+tf.tanh(math.sqrt(2/math.pi)*(x+0.044715*tf.pow(x, 3))))
@@ -78,7 +78,7 @@ def _attn(q, k, v, train=False, scale=False):
     w = mask_attn_weights(w)
     w = tf.nn.softmax(w)
 
-    w = dropout(w, attn_pdrop, train)
+    # w = dropout(w, attn_pdrop, train)
 
     a = tf.matmul(w, v)
     return a
@@ -125,24 +125,24 @@ def attn(x, scope, n_state, n_head, train=False, scale=False):
         a = _attn(q, k, v, train=train, scale=scale)
         a = merge_heads(a)
         a = conv1d(a, 'c_proj', n_state, 1, train=train)
-        a = dropout(a, resid_pdrop, train)
+        # a = dropout(a, resid_pdrop, train)
         return a
 
-def mlp(x, scope, n_state, train=False):
+def mlp(x, scope, n_state, afn, train=False):
     with tf.variable_scope(scope):
         nx = shape_list(x)[-1]
         act = act_fns[afn]
         h = act(conv1d(x, 'c_fc', n_state, 1, train=train))
         h2 = conv1d(h, 'c_proj', nx, 1, train=train)
-        h2 = dropout(h2, resid_pdrop, train)
+        # h2 = dropout(h2, resid_pdrop, train)
         return h2
 
-def block(x, scope, train=False, scale=False):
+def block(x, scope, n_head, afn, train=False, scale=False):
     with tf.variable_scope(scope):
         nx = shape_list(x)[-1]
         a = attn(x, 'attn', nx, n_head, train=train, scale=scale)
         n = norm(x+a, 'ln_1')
-        m = mlp(n, 'mlp', nx*4, train=train)
+        m = mlp(n, 'mlp', nx*4, afn, train=train)
         h = norm(n+m, 'ln_2')
         return h
 
@@ -159,17 +159,17 @@ def clf(x, ny, w_init=tf.random_normal_initializer(stddev=0.02), b_init=tf.const
         b = tf.get_variable("b", [ny], initializer=b_init)
         return tf.matmul(x, w)+b
 
-def model(X, M, Y, train=False, reuse=False):
+def model(X, M, Y, n_vocab, n_special, n_ctx, n_embd, n_layer, n_head, afn, clf_token, train=False, reuse=False):
     with tf.variable_scope('model', reuse=reuse):
         we = tf.get_variable("we", [n_vocab+n_special+n_ctx, n_embd], initializer=tf.random_normal_initializer(stddev=0.02))
-        we = dropout(we, embd_pdrop, train)
+        # we = dropout(we, embd_pdrop, train)
 
         X = tf.reshape(X, [-1, n_ctx, 2])
         M = tf.reshape(M, [-1, n_ctx])
 
         h = embed(X, we)
         for layer in range(n_layer):
-            h = block(h, 'h%d'%layer, train=train, scale=True)
+            h = block(h, 'h%d'%layer, n_head, afn, train=train, scale=True)
 
         lm_h = tf.reshape(h[:, :-1], [-1, n_embd])
         lm_logits = tf.matmul(lm_h, we, transpose_b=True)
@@ -179,7 +179,8 @@ def model(X, M, Y, train=False, reuse=False):
 
         clf_h = tf.reshape(h, [-1, n_embd])
         pool_idx = tf.cast(tf.argmax(tf.cast(tf.equal(X[:, :, 0], clf_token), tf.float32), 1), tf.int32)
-        clf_h = tf.gather(clf_h, tf.range(shape_list(X)[0], dtype=tf.int32)*n_ctx+pool_idx)
+        gather_indices = tf.range(shape_list(X)[0], dtype=tf.int32)*n_ctx+pool_idx
+        clf_h = tf.gather(clf_h, gather_indices)
 
         clf_h = tf.reshape(clf_h, [-1, 2, n_embd])
         if train and clf_pdrop > 0:
@@ -191,7 +192,7 @@ def model(X, M, Y, train=False, reuse=False):
         clf_logits = tf.reshape(clf_logits, [-1, 2])
 
         clf_losses = tf.nn.sparse_softmax_cross_entropy_with_logits(logits=clf_logits, labels=Y)
-        return clf_logits, clf_losses, lm_losses
+        return clf_logits, clf_losses, clf_h
 
 def mgpu_train(*xs):
     gpu_ops = []
